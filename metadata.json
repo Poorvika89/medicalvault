@@ -1,0 +1,6 @@
+{
+  "name": "MedVault",
+  "description": "A secure digital repository for medical records, prescriptions, and reports, enabling secure sharing between patients and authorized doctors.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["Firebase Authentication", "Cloud Firestore", "Cloud Storage"]
+}

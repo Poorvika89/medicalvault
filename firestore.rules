@@ -1,0 +1,111 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // 0. Default Deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // --- Helpers ---
+    function isSignedIn() { return request.auth != null; }
+    function isVerifiedUser() { return isSignedIn() && request.auth.token.email_verified == true; }
+    function isOwner(userId) { return isSignedIn() && request.auth.uid == userId; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
+    
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
+    }
+
+    function hasActiveAccess(patientId) {
+      // Find a granted request for the current doctor
+      return exists(/databases/$(database)/documents/accessRequests/$(patientId + '_' + request.auth.uid)) && 
+             get(/databases/$(database)/documents/accessRequests/$(patientId + '_' + request.auth.uid)).data.status == 'granted';
+    }
+
+    // --- Entity Validations ---
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['uid', 'email', 'role', 'fullName']) &&
+             data.uid == request.auth.uid &&
+             data.email is string &&
+             data.role in ['patient', 'doctor'] &&
+             data.fullName is string && data.fullName.size() <= 100 &&
+             (!('age' in data) || (data.age is number && data.age >= 0 && data.age <= 150)) &&
+             (!('bloodGroup' in data) || (data.bloodGroup is string && data.bloodGroup.size() <= 5)) &&
+             (!('address' in data) || (data.address is string && data.address.size() <= 500));
+    }
+
+    function isValidMedicalRecord(data, patientId) {
+      return data.keys().hasAll(['patientId', 'type', 'title', 'fileUrl', 'createdAt']) &&
+             data.patientId == patientId &&
+             data.type in ['prescription', 'report', 'document'] &&
+             data.title is string && data.title.size() <= 200 &&
+             data.fileUrl is string && data.fileUrl.size() <= 2048 &&
+             data.createdAt is timestamp;
+    }
+
+    // --- Routes ---
+
+    // User Profiles
+    match /users/{userId} {
+      allow get: if isOwner(userId) || (isSignedIn() && hasActiveAccess(userId));
+      allow list: if false; // No blanket listing of users
+      
+      allow create: if isOwner(userId) && isValidUserProfile(incoming());
+      allow update: if isOwner(userId) && 
+                    isValidUserProfile(incoming()) &&
+                    incoming().role == existing().role && // Role immutable
+                    incoming().email == existing().email &&
+                    incoming().diff(existing()).affectedKeys().hasOnly([
+                      'fullName', 'age', 'gender', 'bloodGroup', 'address', 
+                      'medicalDegree', 'qualification', 'preferredLanguage'
+                    ]);
+    }
+
+    // Medical Records
+    match /users/{userId}/records/{recordId} {
+      allow get: if isOwner(userId) || (isSignedIn() && hasActiveAccess(userId));
+      allow list: if isOwner(userId) || (isSignedIn() && hasActiveAccess(userId));
+      
+      allow create: if isOwner(userId) && isValidMedicalRecord(incoming(), userId);
+      allow update: if isOwner(userId) && isValidMedicalRecord(incoming(), userId);
+      allow delete: if isOwner(userId);
+    }
+
+    // Access Requests
+    match /accessRequests/{requestId} {
+      // Logic: requestId is often patientId_doctorId
+      allow get: if isSignedIn() && (request.auth.uid == incoming().patientId || request.auth.uid == incoming().doctorId);
+      allow list: if isSignedIn() && (
+        resource.data.patientId == request.auth.uid || 
+        resource.data.doctorId == request.auth.uid
+      );
+
+      allow create: if isSignedIn() && 
+                    incoming().doctorId == request.auth.uid &&
+                    incoming().status == 'pending' &&
+                    isValidId(incoming().patientId);
+      
+      allow update: if isSignedIn() && (
+        // Patient grants or revokes
+        (isOwner(existing().patientId) && incoming().diff(existing()).affectedKeys().hasOnly(['status'])) ||
+        // Doctor cancels
+        (isOwner(existing().doctorId) && incoming().status == 'revoked')
+      );
+    }
+
+    // Notifications
+    match /users/{userId}/notifications/{notificationId} {
+      allow read: if isOwner(userId);
+      allow update: if isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
+      allow delete: if isOwner(userId);
+    }
+    
+    // Access Logs
+    match /users/{userId}/accessLogs/{logId} {
+      allow read: if isOwner(userId);
+      allow create: if isSignedIn() && hasActiveAccess(userId) && incoming().patientId == userId;
+    }
+  }
+}
